@@ -1,11 +1,11 @@
 from __future__ import annotations, annotations as _annotations
 
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from pydantic import TypeAdapter
 from typing_extensions import assert_never
@@ -27,6 +27,7 @@ from pydantic_ai.messages import (
     VideoUrl,
 )
 
+from . import _utils
 from .agent import Agent, AgentDepsT, OutputDataT
 
 # AgentWorker output type needs to be invariant for use in both parameter and return positions
@@ -74,6 +75,9 @@ async def worker_lifespan(app: FastA2A, worker: Worker, agent: Agent[AgentDepsT,
 def agent_to_a2a(
     agent: Agent[AgentDepsT, OutputDataT],
     *,
+    deps_factory: Callable[[TaskSendParams], AgentDepsT]
+    | Callable[[TaskSendParams], Awaitable[AgentDepsT]]
+    | None = None,
     enable_streaming: bool = False,
     storage: Storage | None = None,
     broker: Broker | None = None,
@@ -94,7 +98,9 @@ def agent_to_a2a(
     """Create a FastA2A server from an agent."""
     storage = storage or InMemoryStorage()
     broker = broker or InMemoryBroker()
-    worker = AgentWorker(agent=agent, broker=broker, storage=storage, enable_streaming=enable_streaming)
+    worker = AgentWorker(
+        agent=agent, broker=broker, storage=storage, deps_factory=deps_factory, enable_streaming=enable_streaming
+    )
 
     lifespan = lifespan or partial(worker_lifespan, worker=worker, agent=agent)
 
@@ -121,6 +127,9 @@ class AgentWorker(Worker[list[ModelMessage]], Generic[WorkerOutputT, AgentDepsT]
     """A worker that uses an agent to execute tasks."""
 
     agent: Agent[AgentDepsT, WorkerOutputT]
+    deps_factory: Callable[[TaskSendParams], AgentDepsT] | Callable[[TaskSendParams], Awaitable[AgentDepsT]] | None = (
+        None
+    )
     enable_streaming: bool = False
 
     async def run_task(self, params: TaskSendParams) -> None:
@@ -153,27 +162,22 @@ class AgentWorker(Worker[list[ModelMessage]], Generic[WorkerOutputT, AgentDepsT]
         message_history = await self.storage.load_context(task['context_id']) or []
         message_history.extend(self.build_message_history(task.get('history', [])))
 
+        # Extract dependencies from task if deps_factory is provided
+        if self.deps_factory is not None:
+            if _utils.is_async_callable(self.deps_factory):
+                deps: AgentDepsT = await self.deps_factory(params)
+            else:
+                deps: AgentDepsT = self.deps_factory(params)
+        else:
+            deps: AgentDepsT = cast(AgentDepsT, None)
+
         try:
             # Stream processing with agent.iter()
-            async with self.agent.iter(message_history=message_history, deps=None) as run:  # type: ignore
+            async with self.agent.iter(message_history=message_history, deps=deps) as run:
                 node = run.next_node
                 while not self.agent.is_end_node(node):
-                    # Check if this node has a model response
-                    if hasattr(node, 'model_response'):
-                        model_response = getattr(node, 'model_response')
-                        # Convert model response parts to A2A parts
-                        a2a_parts = self._response_parts_to_a2a(model_response.parts)
-
-                        if a2a_parts and self.enable_streaming:
-                            # Send incremental message event with unique ID
-                            incremental_message = Message(
-                                role='agent',
-                                parts=a2a_parts,
-                                kind='message',
-                                message_id=str(uuid.uuid4()),  # Generate unique ID per message
-                            )
-                            # Stream the incremental message
-                            await self.broker.send_stream_event(task['id'], incremental_message)
+                    # Handle streaming if enabled
+                    await self._handle_streaming_response(node, task['id'])
 
                     # Move to next node
                     current = node
@@ -252,6 +256,24 @@ class AgentWorker(Worker[list[ModelMessage]], Generic[WorkerOutputT, AgentDepsT]
 
     async def cancel_task(self, params: TaskIdParams) -> None:
         pass
+
+    async def _handle_streaming_response(self, node: Any, task_id: str) -> None:
+        """Handle streaming response for a node if streaming is enabled."""
+        if hasattr(node, 'model_response'):
+            model_response = getattr(node, 'model_response')
+            # Convert model response parts to A2A parts
+            a2a_parts = self._response_parts_to_a2a(model_response.parts)
+
+            if a2a_parts and self.enable_streaming:
+                # Send incremental message event with unique ID
+                incremental_message = Message(
+                    role='agent',
+                    parts=a2a_parts,
+                    kind='message',
+                    message_id=str(uuid.uuid4()),  # Generate unique ID per message
+                )
+                # Stream the incremental message
+                await self.broker.send_stream_event(task_id, incremental_message)
 
     def build_artifacts(self, result: WorkerOutputT) -> list[Artifact]:
         """Build artifacts from agent result.
