@@ -1,14 +1,16 @@
 import uuid
+from dataclasses import dataclass
 from typing import Any, cast
 
 import anyio
 import httpx
 import pytest
 from asgi_lifespan import LifespanManager
+from httpx import ASGITransport
 from inline_snapshot import snapshot
 from pydantic import BaseModel
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -25,10 +27,12 @@ from pydantic_ai.usage import Usage
 from .conftest import IsDatetime, IsStr, try_import
 
 with try_import() as imports_successful:
-    from fasta2a.broker import StreamEvent
+    from fasta2a.broker import InMemoryBroker, StreamEvent
     from fasta2a.client import A2AClient
-    from fasta2a.schema import DataPart, FilePart, Message, TextPart
+    from fasta2a.schema import DataPart, FilePart, Message, TaskSendParams, TextPart
     from fasta2a.storage import InMemoryStorage
+
+    from pydantic_ai._a2a import agent_to_a2a
 
 
 pytestmark = [
@@ -45,6 +49,20 @@ def return_string(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
 
 
 model = FunctionModel(return_string)
+
+
+async def wait_for_task(client: A2AClient, task_id: str, timeout_loops: int = 10) -> Any:
+    """Wait for a task to complete or fail, using polling pattern."""
+    for _ in range(timeout_loops):
+        task_response = await client.get_task(task_id)
+        if task_response and 'result' in task_response:
+            task = task_response['result']
+            if task['status']['state'] in ('completed', 'failed'):
+                return task
+        await anyio.sleep(0.1)
+
+    # If we get here, task didn't complete in time
+    pytest.fail(f'Task {task_id} did not complete within {timeout_loops * 0.1} seconds')
 
 
 # Define a test Pydantic model
@@ -88,11 +106,7 @@ async def test_a2a_pydantic_model_output():
             task_id = result['id']
 
             # Wait for completion
-            await anyio.sleep(0.1)
-            task = await a2a_client.get_task(task_id)
-
-            assert 'result' in task
-            result = task['result']
+            result = await wait_for_task(a2a_client, task_id)
             assert result['status']['state'] == 'completed'
 
             # Check artifacts
@@ -517,11 +531,8 @@ async def test_a2a_error_handling():
             task_id = result['id']
 
             # Wait for task to fail
-            await anyio.sleep(0.1)
-            task = await a2a_client.get_task(task_id)
-
-            assert 'result' in task
-            assert task['result']['status']['state'] == 'failed'
+            task_result = await wait_for_task(a2a_client, task_id)
+            assert task_result['status']['state'] == 'failed'
 
 
 async def test_a2a_multiple_tasks_same_context():
@@ -563,10 +574,8 @@ async def test_a2a_multiple_tasks_same_context():
             context_id = result1['context_id']
 
             # Wait for first task to complete
-            await anyio.sleep(0.1)
-            task1 = await a2a_client.get_task(task1_id)
-            assert 'result' in task1
-            assert task1['result']['status']['state'] == 'completed'
+            task1_result = await wait_for_task(a2a_client, task1_id)
+            assert task1_result['status']['state'] == 'completed'
 
             # Verify the model received at least one message
             assert len(messages_received) == 1
@@ -670,11 +679,8 @@ async def test_a2a_thinking_response():
             task_id = result['id']
 
             # Wait for completion
-            await anyio.sleep(0.1)
-            task = await a2a_client.get_task(task_id)
-
-            assert 'result' in task
-            assert task['result'] == snapshot(
+            task_result = await wait_for_task(a2a_client, task_id)
+            assert task_result == snapshot(
                 {
                     'id': IsStr(),
                     'context_id': IsStr(),
@@ -1041,11 +1047,7 @@ async def test_streaming_emits_incremental_messages(mocker: Any) -> None:
             task_id = result['id']
 
             # Wait for task completion
-            await anyio.sleep(0.1)
-            final_response = await a2a_client.get_task(task_id)
-            assert 'result' in final_response
-            final_result = final_response['result']
-            assert final_result['status']['state'] == 'completed'
+            await wait_for_task(a2a_client, task_id)
 
             # Verify streaming events were captured
             assert mock_send.call_count > 0
@@ -1128,11 +1130,7 @@ async def test_streaming_disabled_sends_only_final_results(mocker: Any) -> None:
             task_id = result['id']
 
             # Wait for task completion
-            await anyio.sleep(0.1)
-            final_response = await a2a_client.get_task(task_id)
-            assert 'result' in final_response
-            final_result = final_response['result']
-            assert final_result['status']['state'] == 'completed'
+            await wait_for_task(a2a_client, task_id)
 
             # Verify streaming events were captured
             assert mock_send.call_count > 0
@@ -1160,6 +1158,9 @@ async def test_streaming_disabled_sends_only_final_results(mocker: Any) -> None:
             assert len(status_events) >= 2, 'Should have at least working and completed status updates'
 
             # Verify final result is complete and correct
+            final_result = await a2a_client.get_task(task_id)
+            assert 'result' in final_result
+            final_result = final_result['result']
             assert 'artifacts' in final_result
             artifacts = final_result['artifacts']
             assert len(artifacts) == 1
@@ -1170,3 +1171,389 @@ async def test_streaming_disabled_sends_only_final_results(mocker: Any) -> None:
             assert artifact_part['kind'] == 'text'
             # Final result should contain all text parts concatenated
             assert 'First part of response' in artifact_part['text']
+
+
+# =====================================================================
+# Dependency Injection Tests
+# =====================================================================
+
+
+@dataclass
+class MyDeps:
+    """Test dependencies for dependency injection."""
+
+    user_id: str
+    auth_level: str
+    custom_data: dict[str, Any]
+
+
+def create_test_deps(params: TaskSendParams) -> MyDeps:
+    """Factory function to create dependencies from task send params metadata."""
+    metadata = params.get('metadata', {})
+    return MyDeps(
+        user_id=metadata.get('user_id', 'default_user'),
+        auth_level=metadata.get('auth_level', 'basic'),
+        custom_data=metadata.get('custom_data', {}),
+    )
+
+
+async def test_deps_factory_provides_dependencies():
+    """Test that deps_factory correctly provides dependencies to the agent."""
+    # Track what dependencies were received
+    received_deps: list[MyDeps] = []
+
+    def model_func(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        """Mock model that calls a tool on first request, then returns the tool result as final answer."""
+        # Check if this is the first call or if we've already called the tool
+        has_tool_return = any(
+            isinstance(part, ToolReturnPart) and part.tool_name == 'get_user_info'
+            for msg in messages
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+        )
+
+        if has_tool_return:
+            # Second call - we've already called the tool, return a final text response
+            return ModelResponse(parts=[PydanticAITextPart(content='Tool call completed successfully')])
+        else:
+            # First call - request the tool
+            return ModelResponse(parts=[ToolCallPart(tool_name='get_user_info', args={}, tool_call_id='1')])
+
+    agent = Agent(model=FunctionModel(model_func), deps_type=MyDeps)
+
+    @agent.tool
+    def get_user_info(ctx: RunContext[MyDeps]) -> str:
+        """Get user information from dependencies."""
+        # Track the dependencies we received
+        received_deps.append(ctx.deps)
+        return f'User: {ctx.deps.user_id}, Auth: {ctx.deps.auth_level}'
+
+    # Create A2A app with deps_factory
+    storage = InMemoryStorage()
+    broker = InMemoryBroker()
+    app = agent_to_a2a(agent, deps_factory=create_test_deps, storage=storage, broker=broker)
+
+    async with LifespanManager(app):
+        transport = ASGITransport(app)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            a2a_client = A2AClient(http_client=http_client)
+
+            # Send message with metadata that will be used by deps_factory
+            message = Message(
+                role='user',
+                parts=[TextPart(text='Get my user info', kind='text')],
+                kind='message',
+                message_id=str(uuid.uuid4()),
+            )
+
+            # Send with custom metadata
+            response = await a2a_client.send_message(
+                message=message,
+                metadata={
+                    'user_id': 'test_user_123',
+                    'auth_level': 'admin',
+                    'custom_data': {'preference': 'dark_mode'},
+                },
+            )
+
+            assert 'result' in response
+            result = response['result']
+            assert result['kind'] == 'task'
+            task_id = result['id']
+
+            # Wait for task completion
+            task = await wait_for_task(a2a_client, task_id)
+
+            # Debug output if task failed
+            if task['status']['state'] == 'failed':
+                print(f'Task failed. Full task response: {task}')
+                if 'history' in task:
+                    print(f'Task history: {task["history"]}')
+
+            assert task['status']['state'] == 'completed'
+
+            # Verify the dependencies were provided correctly
+            assert len(received_deps) == 1
+            deps = received_deps[0]
+            assert deps.user_id == 'test_user_123'
+            assert deps.auth_level == 'admin'
+            assert deps.custom_data == {'preference': 'dark_mode'}
+
+            # Check the tool was called with correct deps
+            messages = task.get('history', [])
+            agent_messages = [m for m in messages if m['role'] == 'agent']
+            assert len(agent_messages) > 0
+
+            # The agent should have processed the tool call and returned a final response
+            # We should see "Tool call completed successfully" in the final message
+            found_final_response = False
+            for msg in agent_messages:
+                for part in msg['parts']:
+                    if part.get('kind') == 'text' and 'Tool call completed successfully' in part.get('text', ''):
+                        found_final_response = True
+                        break
+                if found_final_response:
+                    break
+
+            assert found_final_response, 'Expected final response not found in agent messages'
+
+
+async def test_deps_factory_with_no_deps():
+    """Test that agents without deps_factory still work correctly."""
+
+    def model_func(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        return ModelResponse(parts=[PydanticAITextPart(content='Hello from agent')])
+
+    # Agent without deps_type
+    agent = Agent(model=FunctionModel(model_func))
+
+    storage = InMemoryStorage()
+    broker = InMemoryBroker()
+
+    # Create A2A app without deps_factory
+    app = agent_to_a2a(agent, storage=storage, broker=broker)
+
+    async with LifespanManager(app):
+        transport = ASGITransport(app)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            a2a_client = A2AClient(http_client=http_client)
+
+            message = Message(
+                role='user',
+                parts=[TextPart(text='Hello', kind='text')],
+                kind='message',
+                message_id=str(uuid.uuid4()),
+            )
+
+            response = await a2a_client.send_message(message=message)
+            assert 'result' in response
+            result = response['result']
+            assert result['kind'] == 'task'
+            task_id = result['id']
+
+            # Wait for task completion
+            task = await wait_for_task(a2a_client, task_id)
+            assert task['status']['state'] == 'completed'
+
+            # Verify agent responded
+            messages = task.get('history', [])
+            agent_messages = [m for m in messages if m['role'] == 'agent']
+            assert len(agent_messages) > 0
+            assert any('Hello from agent' in part.get('text', '') for msg in agent_messages for part in msg['parts'])
+
+
+async def test_deps_factory_error_handling():
+    """Test error handling when deps_factory raises an exception."""
+
+    def failing_deps_factory(params: TaskSendParams) -> MyDeps:
+        """Factory that always fails."""
+        raise ValueError('Failed to create dependencies')
+
+    def model_func(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        return ModelResponse(parts=[PydanticAITextPart(content='Should not reach here')])
+
+    agent = Agent(model=FunctionModel(model_func), deps_type=MyDeps)
+
+    storage = InMemoryStorage()
+    broker = InMemoryBroker()
+
+    # Create A2A app with failing deps_factory
+    app = agent_to_a2a(agent, deps_factory=failing_deps_factory, storage=storage, broker=broker)
+
+    async with LifespanManager(app):
+        transport = ASGITransport(app)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            a2a_client = A2AClient(http_client=http_client)
+
+            message = Message(
+                role='user',
+                parts=[TextPart(text='Test message', kind='text')],
+                kind='message',
+                message_id=str(uuid.uuid4()),
+            )
+
+            response = await a2a_client.send_message(message=message)
+            assert 'result' in response
+            result = response['result']
+            assert result['kind'] == 'task'
+            task_id = result['id']
+
+            # Wait for task to fail
+            task = await wait_for_task(a2a_client, task_id)
+
+            # Task should fail due to deps_factory error
+            assert task['status']['state'] == 'failed'
+
+
+async def test_deps_factory_type_safety():
+    """Test that deps_factory maintains type safety with agent deps type."""
+
+    @dataclass
+    class SpecificDeps:
+        db_connection: str
+        api_key: str
+
+    def create_specific_deps(params: TaskSendParams) -> SpecificDeps:
+        metadata = params.get('metadata', {})
+        return SpecificDeps(
+            db_connection=metadata.get('db', 'default_db'),
+            api_key=metadata.get('api_key', 'default_key'),
+        )
+
+    def model_func(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        """Mock model that calls a tool on first request, then returns the tool result as final answer."""
+        # Check if this is the first call or if we've already called the tool
+        has_tool_return = any(
+            isinstance(part, ToolReturnPart) and part.tool_name == 'use_specific_deps'
+            for msg in messages
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+        )
+
+        if has_tool_return:
+            # Second call - we've already called the tool, return a final text response
+            return ModelResponse(parts=[PydanticAITextPart(content='Tool call completed successfully')])
+        else:
+            # First call - request the tool
+            return ModelResponse(parts=[ToolCallPart(tool_name='use_specific_deps', args={}, tool_call_id='1')])
+
+    agent = Agent(model=FunctionModel(model_func), deps_type=SpecificDeps)
+
+    @agent.tool
+    def use_specific_deps(ctx: RunContext[SpecificDeps]) -> str:
+        """Use specific dependencies."""
+        return f'DB: {ctx.deps.db_connection}, Key: {ctx.deps.api_key}'
+
+    storage = InMemoryStorage()
+    broker = InMemoryBroker()
+
+    # This should type check correctly
+    app = agent_to_a2a(agent, deps_factory=create_specific_deps, storage=storage, broker=broker)
+
+    async with LifespanManager(app):
+        transport = ASGITransport(app)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            a2a_client = A2AClient(http_client=http_client)
+
+            message = Message(
+                role='user',
+                parts=[TextPart(text='Use deps', kind='text')],
+                kind='message',
+                message_id=str(uuid.uuid4()),
+            )
+
+            response = await a2a_client.send_message(
+                message=message, metadata={'db': 'production_db', 'api_key': 'secret_key'}
+            )
+
+            assert 'result' in response
+            result = response['result']
+            assert result['kind'] == 'task'
+            task_id = result['id']
+
+            # Wait for task completion
+            task = await wait_for_task(a2a_client, task_id)
+            assert task['status']['state'] == 'completed'
+
+            # Verify the agent completed the task with the tool call
+            messages = task.get('history', [])
+            agent_messages = [m for m in messages if m['role'] == 'agent']
+            assert any(
+                'Tool call completed successfully' in part.get('text', '')
+                for msg in agent_messages
+                for part in msg['parts']
+            )
+
+
+async def test_async_deps_factory():
+    """Test that async deps_factory works correctly."""
+    # Track what dependencies were received
+    received_deps: list[MyDeps] = []
+    factory_call_count = 0
+
+    async def create_async_deps(params: TaskSendParams) -> MyDeps:
+        """Async factory that simulates database/API calls."""
+        nonlocal factory_call_count
+        factory_call_count += 1
+
+        # Simulate async I/O operation (e.g., database query)
+        await anyio.sleep(0.01)
+
+        metadata = params.get('metadata', {})
+        # Simulate more complex async logic
+        user_id = metadata.get('user_id', 'default_user')
+
+        # Another async operation (e.g., fetch permissions)
+        await anyio.sleep(0.01)
+        auth_level = metadata.get('auth_level', 'basic')
+
+        return MyDeps(
+            user_id=user_id, auth_level=auth_level, custom_data={'async': True, 'call_number': factory_call_count}
+        )
+
+    def model_func(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        """Mock model that calls a tool on first request, then returns the tool result as final answer."""
+        has_tool_return = any(
+            isinstance(part, ToolReturnPart) and part.tool_name == 'check_async_deps'
+            for msg in messages
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+        )
+
+        if has_tool_return:
+            return ModelResponse(parts=[PydanticAITextPart(content='Async deps test completed')])
+        else:
+            return ModelResponse(parts=[ToolCallPart(tool_name='check_async_deps', args={}, tool_call_id='1')])
+
+    agent = Agent(model=FunctionModel(model_func), deps_type=MyDeps)
+
+    @agent.tool
+    def check_async_deps(ctx: RunContext[MyDeps]) -> str:
+        """Tool that verifies async deps were created properly."""
+        received_deps.append(ctx.deps)
+        return f'Async deps received: user={ctx.deps.user_id}, async={ctx.deps.custom_data.get("async")}'
+
+    # Create A2A app with async deps_factory
+    storage = InMemoryStorage()
+    broker = InMemoryBroker()
+    app = agent_to_a2a(agent, deps_factory=create_async_deps, storage=storage, broker=broker)
+
+    async with LifespanManager(app):
+        transport = ASGITransport(app)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            a2a_client = A2AClient(http_client=http_client)
+
+            # Send message with metadata
+            message = Message(
+                role='user',
+                parts=[TextPart(text='Check async deps', kind='text')],
+                kind='message',
+                message_id=str(uuid.uuid4()),
+            )
+
+            response = await a2a_client.send_message(
+                message=message,
+                metadata={
+                    'user_id': 'async_test_user',
+                    'auth_level': 'admin',
+                },
+            )
+
+            assert 'result' in response
+            result = response['result']
+            assert result['kind'] == 'task'
+            task_id = result['id']
+
+            # Wait for task completion
+            task = await wait_for_task(a2a_client, task_id)
+            assert task['status']['state'] == 'completed'
+
+            # Verify async deps were created and used
+            assert factory_call_count == 1
+            assert len(received_deps) == 1
+
+            deps = received_deps[0]
+            assert deps.user_id == 'async_test_user'
+            assert deps.auth_level == 'admin'
+            assert deps.custom_data['async'] is True
+            assert deps.custom_data['call_number'] == 1
